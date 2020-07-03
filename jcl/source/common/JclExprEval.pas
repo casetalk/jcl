@@ -183,6 +183,9 @@ type
     etEof,
     etNumber,
     etIdentifier,
+    etWhitespace,
+    etText,
+    etAssign,
 
     // user extension tokens
     etUser0, etUser1, etUser2, etUser3, etUser4, etUser5, etUser6, etUser7,
@@ -518,9 +521,14 @@ type
 { some concrete class descendants follow... }
 
   TExprSimpleLexer = class(TExprLexer)
-  protected
+  private
+    FLine, FTokenCol, FCharCol: integer;
+    FIgnoreWhitespace: boolean;
+    FIgnoreText: boolean;
+    FTokenQuote: string;
     FCurrPos: PChar;
     FBuf: string;
+  protected
     procedure SetBuf(const ABuf: string);
   public
     constructor Create(const ABuf: string);
@@ -529,6 +537,18 @@ type
     procedure Reset; override;
 
     property Buf: string read FBuf write SetBuf;
+
+    { IgnoreWhitespace returns no tokens for whitespace. If set to false, the
+      whitespace is returned as a token. }
+    property IgnoreWhitespace: boolean read FIgnoreWhitespace write FIgnoreWhitespace;
+    { IgnoreText does not return quotes and characters as a single token. If set
+      to true, the content of the quoted characters are returned as a single token. }
+    property IgnoreText: boolean read FIgnoreText write FIgnoreText;
+    { In case of the token etText, this property returns the actual quote character. }
+    property TokenQuote: string read FTokenQuote;
+
+    property Line: integer read FLine;
+    property Col: integer read FTokenCol;
   end;
 
   TExprVirtMachOp = class(TObject)
@@ -1540,6 +1560,13 @@ end;
 constructor TExprSimpleLexer.Create(const ABuf: string);
 begin
   FBuf := ABuf;
+
+  FIgnoreWhitespace := True; { default Jcl behaviour }
+  FIgnoreText := True; { default Jcl behaviour, meaning texts are not considered a token }
+  FLine := 1;
+  FTokenCol := 1;
+  FCharCol := 1;
+
   inherited Create;
 end;
 
@@ -1624,23 +1651,75 @@ var
   {$IFNDEF RTL150_UP}
   OldSep: Char;
   {$ENDIF !RTL150_UP}
+  Quote: PChar;
+
+  function PeekChar: Char;
+  begin
+    if cp^ <> #0 then
+      Result := (cp+1)^
+    else
+      Result := cp^;
+  end;
+
+  function CurrChar: Char;
+  begin
+    Result := cp^;
+  end;
+
+  function NextChar: Char;
+  begin
+    Result := cp^;
+    Inc(cp);
+    if (cp^ >= #32) and (cp^ < #255) then
+      Inc(FCharCol);
+  end;
+
 begin
+  FTokenCol := FCharCol; { start where left off }
+  FTokenQuote := ''; { reset, until a quoted text is found and ignoretext is false }
+
   cp := FCurrPos;
 
-  { skip whitespace }
-  while CharIsWhiteSpace(cp^) do
-    Inc(cp);
+  { skip or gather whitespace }
+  if CharIsWhiteSpace(CurrChar) then
+  begin
+    if (not IgnoreWhitespace) then
+      start := cp;
+
+    { routines to go through the whitespace characters }
+    while CharIsWhiteSpace(CurrChar) do
+    begin
+      if (CurrChar = #13) then
+        Inc(FLine);
+
+      if (NextChar in [#13,#10]) then
+      begin
+        FCharCol := 1;
+        FTokenCol := 1;
+      end;
+    end;
+
+    if (not IgnoreWhitespace) then
+    begin
+      SetString(FTokenAsString, start, cp - start);
+      FCurrTok := etWhitespace;
+      FCurrPos := cp;
+      Exit;
+    end
+    else
+      FTokenCol := FCharCol; { use start col at first non whitespace char }
+  end;
 
   { determine token type }
-  case cp^ of
+  case CurrChar of
     #0:
       FCurrTok := etEof;
     'a'..'z', 'A'..'Z', '_':
       begin
         start := cp;
-        Inc(cp);
-        while CharIsValidIdentifierLetter(cp^) do
-          Inc(cp);
+        while CharIsValidIdentifierLetter(CurrChar) do
+          NextChar;
+
         SetString(FTokenAsString, start, cp - start);
         FCurrTok := etIdentifier;
       end;
@@ -1649,25 +1728,25 @@ begin
         start := cp;
 
         { read in integer part of mantissa }
-        while CharIsDigit(cp^) do
-          Inc(cp);
+        while CharIsDigit(CurrChar) do
+          NextChar;
 
         { check for and read in fraction part of mantissa }
-        if cp^ = '.' then
+        if CurrChar = '.' then
         begin
-          Inc(cp);
-          while CharIsDigit(cp^) do
-            Inc(cp);
+          NextChar;
+          while CharIsDigit(CurrChar) do
+            NextChar;
         end;
 
         { check for and read in exponent }
         if (cp^ = 'e') or (cp^ = 'E') then
         begin
-          Inc(cp);
+          NextChar;
           if (cp^ = '+') or (cp^ = '-') then
-            Inc(cp);
+            NextChar;
           while CharIsDigit(cp^) do
-            Inc(cp);
+            NextChar;
         end;
 
         { evaluate number }
@@ -1687,19 +1766,65 @@ begin
 
         FCurrTok := etNumber;
       end;
+    '"',
+    '''': { single quote char }
+      begin
+        if (IgnoreText) then
+        begin
+          { map character to token }
+          if Word(cp^) <= 255 then
+          begin
+            FCurrTok := CharToTokenMap[AnsiChar(cp^)];
+            FTokenAsString := cp^;
+          end
+          else
+          begin
+            FCurrTok := etInvalid;
+            FTokenAsString := '';
+          end;
+          NextChar;
+        end
+        else
+        begin
+          FTokenQuote := CurrChar;
+          Quote := cp;
+          NextChar;
+          FTokenCol := FCharCol; { start at first char inside text token }
+          start := cp;
+          while (CurrChar <> Quote^) and (CurrChar <> #0) do
+            NextChar;
+
+          SetString(FTokenAsString, start, cp - start);
+          NextChar;
+          FCurrTok := etText;
+        end;
+      end;
+    ':':
+      begin
+        NextChar;
+        if (cp^ = '=') then
+        begin
+          FTokenCol := FCharCol-1; { start at first char inside text token }
+          SetString(FTokenAsString, cp - 1, 2);
+          NextChar;
+          FCurrTok := etAssign;
+        end
+        else
+          FCurrTok := etColon;
+      end;
     '<':
       begin
-        Inc(cp);
+        NextChar;
         case cp^ of
           '=':
             begin
               FCurrTok := etLessEqual;
-              Inc(cp);
+              NextChar;
             end;
           '>':
             begin
               FCurrTok := etNotEqual;
-              Inc(cp);
+              NextChar;
             end;
         else
           FCurrTok := etLessThan;
@@ -1707,22 +1832,30 @@ begin
       end;
     '>':
       begin
-        Inc(cp);
+        NextChar;
         if cp^ = '=' then
         begin
           FCurrTok := etGreaterEqual;
-          Inc(cp);
+          NextChar;
         end
         else
           FCurrTok := etGreaterThan;
       end;
-  else
-    { map character to token }
-    if Word(cp^) < 256 then
-      FCurrTok := CharToTokenMap[AnsiChar(cp^)]
     else
-      FCurrTok := etInvalid;
-    Inc(cp);
+      begin
+        { map remaining character to tokens }
+        if Word(cp^) <= 255 then
+        begin
+          FCurrTok := CharToTokenMap[AnsiChar(cp^)];
+          FTokenAsString := cp^;
+        end
+        else
+        begin
+          FCurrTok := etInvalid;
+          FTokenAsString := '';
+        end;
+        NextChar;
+      end;
   end;
 
   FCurrPos := cp;
@@ -1740,7 +1873,7 @@ begin
   Reset;
 end;
 
-//=== { TExprNode } ==========================================================
+//== { TExprNode } ==========================================================
 
 constructor TExprNode.Create(const ADepList: array of TExprNode);
 var
